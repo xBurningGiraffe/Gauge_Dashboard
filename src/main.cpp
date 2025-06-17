@@ -3,14 +3,20 @@
 #include <esp32_smartdisplay.h>
 #include <lvgl.h>
 #include <time.h>
+// #include "utils/espnow_utils.h"
+#include "gauges/fluid_seg_gauge.h"
+#include "utils/espnow_fluid.h"
+#include "utils/espnow_flow.h"
+#include "utils/espnow_boost.h"
+#include "utils/espnow_boostsafe.h"
+#include "utils/espnow_dispatcher.h"
+#include "utils/espnow_time.h"
 
 extern "C"
 {
-#include "boot_screen.h"
-#include "dashboard_layout.h"
-#include "wmi_flow_gauge.h"
-#include "boost_gauge.h"
-#include "fluid_seg_gauge.h"
+#include "ui/ui.h"         // boot_screen.h + dashboard_layout.h
+#include "gauges/gauges.h" // other C‐based gauge headers
+#include "fonts/fonts.h"   // your aggregated font headers
 }
 
 // LVGL tick period in ms
@@ -23,78 +29,103 @@ static constexpr uint32_t SPLASH_DURATION_MS = 3000;
 static Ticker lvgl_tick_ticker;
 static lv_timer_t *splash_end_timer = nullptr;
 
-// Animation state
-static int g_flow_value = 0;    // 0…25 psi
-static int g_boost_value = -10; // –10…30 psi
-static uint8_t g_metho_pct = 0; // 0…100%
-
-// Gauge animation callbacks
-static void flow_anim_cb(lv_timer_t *t)
-{
-    (void)t;
-    wmi_flow_set_value(g_flow_value);
-    // Smooth wrap: use lv_anim for easing if desired
-    g_flow_value = (g_flow_value + 1) % 26;
-}
-
-static void boost_anim_cb(lv_timer_t *t)
-{
-    (void)t;
-    boost_set_value(g_boost_value);
-    g_boost_value++;
-    if (g_boost_value > 30)
-        g_boost_value = -10;
-}
-
-static void fluid_anim_cb(lv_timer_t *t)
-{
-    (void)t;
-    fluid_seg_set_value(g_metho_pct);
-    g_metho_pct = (g_metho_pct + 1) % 101;
-}
+// ← New globals to manage screens & one-shot handoff
+static lv_obj_t *splash_scr = nullptr;
+static lv_obj_t *dash_scr = nullptr;
+static bool dash_already_up = false;
 
 // Called once splash duration elapses
 static void splash_end_cb(lv_timer_t *timer)
 {
-    lv_timer_del(timer);
-    // Create dashboard UI
-    create_dashboard_layout(lv_scr_act());
+    // Only transition once
+    if (dash_already_up)
+        return;
+    dash_already_up = true;
 
-    // Start gauge animations at 120 ms intervals
-    lv_timer_create(flow_anim_cb, 120, nullptr);
-    lv_timer_create(boost_anim_cb, 120, nullptr);
-    lv_timer_create(fluid_anim_cb, 120, nullptr);
+    // Stop the timer so it never fires again
+    lv_timer_del(timer);
+
+    // 1) Build the dashboard on a fresh screen
+    dash_scr = lv_obj_create(NULL);
+    create_dashboard_layout(dash_scr);
+
+    // 2) Load that dashboard screen
+    lv_scr_load(dash_scr);
+
+    // 3) Completely delete the old splash screen
+    lv_obj_del(splash_scr);
+
+    // 4) Now kick off your ESP-NOW dispatcher
+    espnow_dispatcher_init();
 }
 
 void setup()
 {
-    // Initialize serial for debugging
+    // 1) Serial for debug
     Serial.begin(115200);
     delay(100);
 
-    // Initialize LVGL + display + touch + PSRAM
+    // 2) Init display, touch, LVGL, PSRAM
     smartdisplay_init();
 
-    // Set up LVGL tick on a regular hardware timer
+    // 3) LVGL tick via hw timer
     lvgl_tick_ticker.attach_ms(LVGL_TICK_PERIOD_MS, []()
                                { lv_tick_inc(LVGL_TICK_PERIOD_MS); });
 
-    // Show boot splash
+    // 4) Show boot splash on its *own* screen
+    splash_scr = lv_obj_create(NULL);
+    lv_scr_load(splash_scr);
     create_boot_screen();
 
-    // Schedule transition from splash to dashboard
-    splash_end_timer = lv_timer_create(
-        splash_end_cb,
-        SPLASH_DURATION_MS,
-        nullptr);
+    // 5) Schedule the one-shot splash→dashboard transition
+    splash_end_timer = lv_timer_create(splash_end_cb, SPLASH_DURATION_MS, nullptr);
     lv_timer_set_repeat_count(splash_end_timer, 1);
 }
 
 void loop()
 {
-    // Service LVGL tasks (rendering, animations, timers)
+    // 1) Pump LVGL (draw, timers, animations)
     lv_timer_handler();
 
-    // Yield to allow RTOS maintenance and PSRAM cache tasks
+    // 2) Consume any incoming ESP-NOW data flags
+
+    // Fluid gauge (methanol)
+    if (espnow_fluid_newData)
+    {
+        espnow_fluid_newData = false;
+        fluid_seg_set_value(espnow_fluid_pct);
+    }
+    
+    /*
+    // Time update
+    if (espnow_time_newData)
+    {
+        espnow_time_newData = false;
+        update_time_label(espnow_hour, espnow_minute);
+    }
+    */
+   
+    // WMI flow gauge
+    if (espnow_flow_newData)
+    {
+        espnow_flow_newData = false;
+        wmi_flow_set_value(espnow_flow_value);
+    }
+
+    // Boost gauge
+    if (espnow_boost_newData)
+    {
+        espnow_boost_newData = false;
+        boost_set_value(espnow_boost_value);
+    }
+
+    // Boost-Safe indicator
+    if (espnow_boostSafe_newData)
+    {
+        espnow_boostSafe_newData = false;
+        handle_boost_safe_flag(espnow_boostSafe);
+    }
+
+    // 3) Yield to RTOS
     delay(LOOP_DELAY_MS);
 }
